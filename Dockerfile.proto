@@ -1,0 +1,62 @@
+# syntax=docker.io/docker/dockerfile:1.3@sha256:42399d4635eddd7a9b8a24be879d2f9a930d0ed040a61324cfdf59ef1357b3b2
+FROM docker.io/golang:1.17.5@sha256:90d1ab81f3d157ca649a9ff8d251691b810d95ea6023a03cdca139df58bca599 AS go-tools
+
+# Support additional root CAs
+COPY README.md cert.pem* /certs/
+# Debian
+RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/ssl/certs/ca-certificates.crt; fi
+
+RUN mkdir /app
+
+COPY tools/build.sh /app/tools/
+COPY tools/go.* /app/tools/
+
+RUN --mount=type=cache,target=/root/.cache --mount=type=cache,target=/go \
+	cd /app/tools && CGO_ENABLED=0 ./build.sh
+
+# syntax=docker.io/docker/dockerfile:1.3@sha256:42399d4635eddd7a9b8a24be879d2f9a930d0ed040a61324cfdf59ef1357b3b2
+FROM docker.io/golang:1.17.5@sha256:90d1ab81f3d157ca649a9ff8d251691b810d95ea6023a03cdca139df58bca599 AS go-build
+
+# Support additional root CAs
+COPY README.md cert.pem* /certs/
+# Debian
+RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/ssl/certs/ca-certificates.crt; fi
+
+COPY --from=go-tools /app /app
+
+COPY buf.* /app
+COPY proto /app/proto
+
+RUN --mount=type=cache,target=/root/.cache \
+	cd /app && \
+	tools/bin/buf lint && \
+	tools/bin/buf generate
+
+FROM node:16-alpine@sha256:004dbac84fed48e20f9888a23e32fa7cf83c2995e174a78d41d9a9dd1e051a20 AS node-build
+
+# Support additional root CAs
+COPY README.md cert.pem* /certs/
+# Alpine
+RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/ssl/cert.pem; fi
+
+COPY --from=go-tools /app /app
+
+COPY buf.* /app
+COPY proto /app/proto
+
+COPY tools/package.json /app/tools/
+COPY tools/package-lock.json /app/tools/
+
+RUN --mount=type=cache,target=/root/.cache --mount=type=cache,target=/root/.npm \
+ 	cd /app/tools && npm ci
+
+RUN --mount=type=cache,target=/root/.cache \
+	cd /app && \
+	tools/bin/buf generate --template buf.gen.web.yaml
+
+FROM scratch AS go-export
+COPY --from=go-build /app/node/pkg/proto pkg/proto
+
+FROM scratch AS node-export
+COPY --from=node-build /app/sdk/js-proto-web/src sdk/js-proto-web/src
+COPY --from=node-build /app/sdk/js-proto-node/src sdk/js-proto-node/src

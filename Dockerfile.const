@@ -1,0 +1,47 @@
+# syntax=docker.io/docker/dockerfile:1.3@sha256:42399d4635eddd7a9b8a24be879d2f9a930d0ed040a61324cfdf59ef1357b3b2
+FROM docker.io/fedora:34@sha256:321dbc444dfeda328a85dc3c31545a65c1fae8390aa5ba6dc1f5222b53b42697 AS const-build
+
+ARG num_guardians
+ENV NUM_GUARDIANS=$num_guardians
+
+# add additional root CAs
+COPY cert.pem* /certs/
+RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/pki/tls/certs/ca-bundle.crt; fi
+
+# fetch scripts/guardian-set-init.sh deps
+RUN dnf -y install jq
+RUN dnf -y install make
+
+# fetch clients/** deps
+RUN curl -fsSL https://rpm.nodesource.com/setup_16.x | bash - && dnf -y install nodejs
+
+# configure node & npm to work with custom root CAs
+ENV NODE_EXTRA_CA_CERTS=/certs/cert.pem
+ENV NODE_OPTIONS=--use-openssl-ca
+RUN if [ -e /certs/cert.pem ]; then npm config set cafile /certs/cert.pem; fi
+
+# install CLI deps & build
+WORKDIR /clients/js
+# copy package.json & package-lock.json by themselves to create a cache layer
+COPY clients/js/package.json clients/js/package-lock.json ./
+# mount the buildkit cache on npm's cache dir, install dependencies
+RUN --mount=type=cache,target=/root/.npm npm ci
+# copy the rest of the source files, as a layer on top of the deps
+COPY clients/js ./
+# build CLI
+RUN make build
+
+WORKDIR /
+
+COPY scripts ./scripts
+COPY ethereum/.env.test ./ethereum/.env.test
+
+# run guardian-set-init.sh to create env files with the init state for NUM_GUARDIANS
+RUN ./scripts/guardian-set-init.sh $NUM_GUARDIANS
+
+FROM scratch AS const-export
+COPY --from=const-build /scripts/.env.0x ethereum/.env
+COPY --from=const-build /scripts/.env.hex solana/.env
+COPY --from=const-build /scripts/.env.hex terra/tools/.env
+COPY --from=const-build /scripts/.env.hex cosmwasm/tools/.env
+COPY --from=const-build /scripts/.env.hex algorand/.env
